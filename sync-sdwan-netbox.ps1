@@ -5,7 +5,7 @@ param(
 # --- Step 1: Authenticate to SD-WAN and get JSESSIONID ---
 $baseURI = "https://VMANAGEINSTANCEID.sdwan.cisco.com/dataservice"
 $response = Invoke-WebRequest -Method Post `
-    -Uri "https://vmanage-2025324.sdwan.cisco.com/j_security_check" `
+    -Uri "https://VMANAGEINSTANCEID.sdwan.cisco.com/j_security_check" `
     -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
     -Body "j_username=FAKEUSER&j_password=FAKEPASSWORD" `
     -SkipCertificateCheck
@@ -15,6 +15,27 @@ $jsessionid = if ($response.RawContent -match "JSESSIONID=([^;]+)") { $matches[1
 # --- Step 2: Configure NetBox API Access ---
 $netboxbaseurl = "https://NETBOXURI/api"
 $netboxtoken = "NETBOXAPITOKEN"
+$headers = @{
+    "accept"        = "application/json"
+    "Authorization" = "Token $netboxtoken"
+    "Content-Type"  = "application/json"
+}
+# Get the CSRF token from the vManage server
+$tokenResponse = Invoke-WebRequest -Method Get `
+    -Uri "$baseuri/client/token" `
+    -Headers @{ "Cookie" = "JSESSIONID=$jsessionid" } `
+    -SkipCertificateCheck
+
+$token = $tokenResponse.Content
+
+# Create a new header object for vManage requests that includes the token
+$vManageHeaders = @{
+    "Cookie"       = "JSESSIONID=$jsessionid"
+    "X-XSRF-TOKEN" = $token
+}
+# --- Step 2: Configure NetBox API Access ---
+$netboxbaseurl = "https://NETBOXADDRESS/api"
+$netboxtoken = "NETBOXTOKEN"
 $headers = @{
     "accept"        = "application/json"
     "Authorization" = "Token $netboxtoken"
@@ -82,7 +103,6 @@ foreach ($device in $deviceList) {
         Write-Warning "Could not get NetBox ID for device $hostname. Skipping its interfaces and IPs."
         continue
     }
-
     # 5.2: Fetch and Sync Interfaces for the current device
     $interfaceUri = "$baseuri/device/interface?deviceId=$systemIp"
     $interfaceResponse = Invoke-WebRequest -Method Get -Uri $interfaceUri -Headers @{ "Cookie" = "JSESSIONID=$jsessionid" } -SkipCertificateCheck
@@ -102,7 +122,7 @@ foreach ($device in $deviceList) {
 
             $interfacePayload = @{
                 mac_address = $interface.hwaddr
-                enabled = $isEnabled
+                enabled     = $isEnabled
                 description = "VPN: $($interface.'vpn-id'), Port Type: $($interface.'port-type')"
             }
 
@@ -128,7 +148,7 @@ foreach ($device in $deviceList) {
             
             $ipPayload = @{
                 assigned_object_type = "dcim.interface"
-                assigned_object_id = $netboxInterfaceId
+                assigned_object_id   = $netboxInterfaceId
             }
 
             if ($ipCheck.count -gt 0) {
@@ -139,14 +159,202 @@ foreach ($device in $deviceList) {
                     Invoke-WebRequest -Method Patch -Uri "$netboxbaseurl/ipam/ip-addresses/$netboxIpId/" -Headers $headers -Body ($ipPayload | ConvertTo-Json) -SkipCertificateCheck
                     Write-Host "Updated IP assignment for $($interface.'ip-address')"
                 }
-            } else {
+            }
+            else {
                 # IP does not exist, POST it
                 $ipPayload.address = $ipAddress
                 $ipPayload.status = "active"
-                Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/ipam/ip-addresses/" -Headers $headers -Body ($ipPayload | ConvertTo-Json) -SkipCertificateCheck
+                $createIpResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/ipam/ip-addresses/" -Headers $headers -Body ($ipPayload | ConvertTo-Json) -SkipCertificateCheck
+                $netboxIpId = ($createIpResp.Content | ConvertFrom-Json).id
                 Write-Host "Created IP Address: $($interface.'ip-address')"
             }
+
+            # If this is the Sdwan-system-intf, set as primary IPv4 for the device
+            if ($interfaceName -eq "Sdwan-system-intf" -and $netboxIpId) {
+                $primaryPayload = @{
+                    primary_ip4 = $netboxIpId
+                } | ConvertTo-Json
+                Invoke-WebRequest -Method Patch -Uri "$netboxbaseurl/dcim/devices/$netboxDeviceId/" -Headers $headers -Body $primaryPayload -SkipCertificateCheck
+                Write-Host "Set $ipAddress as primary IPv4 for device $hostname"
+            }
         }
+    }
+
+    # Hit the netbox API and get lldp neighbors with the napalm plugin and deviceid
+    # Fetch LLDP neighbors using the NetBox napalm plugin for this device
+    # http://netbox/api/dcim/devices/64/napalm/?method=get_lldp_neighbors
+    # plugins/netbox_napalm_plugin/napalmplatformconfig/55/napalm/?method=get_lldp_neighbors
+    $napalmUri = "$netboxbaseurl/plugins/netbox_napalm_plugin/napalmplatformconfig/$netboxDeviceId/napalm/?method=get_cdp_neighbors_detail"
+    try {
+        $lldpResponse = Invoke-WebRequest -Method Get -Uri $napalmUri -Headers $headers -SkipCertificateCheck
+        $lldpNeighbors = ($lldpResponse.Content | ConvertFrom-Json).get_cdp_neighbors_detail
+        if ($lldpNeighbors) {
+            Write-Host "LLDP neighbors for $hostname"
+            $lldpNeighbors.PSObject.Properties | ForEach-Object {
+                $localInt = $_.Name
+                foreach ($neighbor in $_.Value) {
+                    Write-Host "  Local Interface: $localInt"
+                    foreach ($key in $neighbor.PSObject.Properties.Name) {
+                        Write-Host "    $key : $($neighbor.$key)"
+                    }
+                    # Ensure neighbor model exists in NetBox device-types
+                    $neighborModel = $neighbor.remote_system.platform
+                    if (![string]::IsNullOrWhiteSpace($neighborModel) -and -not $deviceTypeIdMap.ContainsKey($neighborModel)) {
+                        $modelPayload = @{
+                            model        = $neighborModel
+                            manufacturer = 1 # Cisco
+                            slug         = $neighborModel.ToLower() -replace '[^a-z0-9]+', '-'
+                        } | ConvertTo-Json
+                        $modelResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/device-types/" -Headers $headers -Body $modelPayload -SkipCertificateCheck
+                        $deviceTypeIdMap[$neighborModel] = ($modelResp.Content | ConvertFrom-Json).id
+                    }
+                  
+                    # Ensure device role "Switch" exists
+                    if (-not $roleIdMap.ContainsKey("Switch")) {
+                        $rolePayload = @{
+                            name  = "Switch"
+                            slug  = "switch"
+                            color = "00ff00"
+                        } | ConvertTo-Json
+                        $roleResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/device-roles/" -Headers $headers -Body $rolePayload -SkipCertificateCheck
+                        $roleIdMap["Switch"] = ($roleResp.Content | ConvertFrom-Json).id
+                    }
+
+                    # Ensure site exists (use the same as the current device)
+                    $neighborSite = $hostname.Split("-")[0]
+                    if (-not $siteIdMap.ContainsKey($neighborSite)) {
+                        $sitePayload = @{
+                            name = $neighborSite
+                            slug = $neighborSite.ToLower()
+                        } | ConvertTo-Json
+                        $siteResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/sites/" -Headers $headers -Body $sitePayload -SkipCertificateCheck
+                        $siteIdMap[$neighborSite] = ($siteResp.Content | ConvertFrom-Json).id
+                    }
+
+                    # Check if the neighbor device already exists
+                    $neighborName = $neighbor.remote_system_name
+                    if (![string]::IsNullOrWhiteSpace($neighborName)) {
+                        $neighborCheck = (Invoke-WebRequest -Uri "$netboxbaseurl/dcim/devices/?name=$neighborName" -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json
+                        $neighborDeviceId = $null
+
+                        $neighborPayload = @{
+                            serial      = ""
+                            status      = "active"
+                        }
+
+                        if ($neighborCheck.count -gt 0) {
+                            # Device exists, PATCH it
+                            $neighborDeviceId = $neighborCheck.results[0].id
+                            if ($deviceTypeIdMap.ContainsKey($neighborModel)) { $neighborPayload.device_type = $deviceTypeIdMap[$neighborModel] }
+                            if ($roleIdMap.ContainsKey("Switch")) { $neighborPayload.role = $roleIdMap["Switch"] }
+                            if ($siteIdMap.ContainsKey($neighborSite)) { $neighborPayload.site = $siteIdMap[$neighborSite] }
+                            $neighborPayload.platform = 1 # Assuming Cisco platform
+                            $neighborPayload.description = "Discovered as LLDP neighbor of $hostname"
+                            if ($neighbor.remote_mac_address) { $neighborPayload.mac_address = $neighbor.remote_mac_address }
+                            # Remove null or empty properties
+                            $neighborPayload = $neighborPayload.GetEnumerator() | Where-Object { $_.Value -ne $null -and $_.Value -ne "" } | ForEach-Object { @{ ($_.Key) = $_.Value } }
+                            $finalPatchPayload = @{}
+                            foreach ($item in $neighborPayload) {
+                                foreach ($k in $item.Keys) { $finalPatchPayload[$k] = $item[$k] }
+                            }
+                            Invoke-WebRequest -Method Patch -Uri "$netboxbaseurl/dcim/devices/$neighborDeviceId/" -Headers $headers -Body ($finalPatchPayload | ConvertTo-Json) -SkipCertificateCheck
+                            Write-Host "Patched neighbor device: $neighborName"
+                        }
+                        else {
+                            # Device does not exist, POST it
+                            $neighborPayload.name = $neighborName
+                            $neighborPayload.device_type = $deviceTypeIdMap.ContainsKey($neighborModel) ? $deviceTypeIdMap[$neighborModel] : $null
+                            $neighborPayload.role = $roleIdMap["Switch"]
+                            $neighborPayload.site = $siteIdMap[$neighborSite]
+                            $neighborPayload.platform = 1 # Assuming Cisco platform
+                            $neighborPayload.description = "Discovered as LLDP neighbor of $hostname"
+                            if ($neighbor.remote_mac_address) { $neighborPayload.mac_address = $neighbor.remote_mac_address }
+                            # Remove null or empty properties
+                            $neighborPayload = $neighborPayload.GetEnumerator() | Where-Object { $_.Value -ne $null -and $_.Value -ne "" } | ForEach-Object { @{ ($_.Key) = $_.Value } }
+                            $finalPayload = @{}
+                            foreach ($item in $neighborPayload) {
+                                foreach ($k in $item.Keys) { $finalPayload[$k] = $item[$k] }
+                            }
+                            $createResponse = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/devices/" -Headers $headers -Body ($finalPayload | ConvertTo-Json) -SkipCertificateCheck
+                            $neighborDeviceId = ($createResponse.Content | ConvertFrom-Json).id
+                            Write-Host "Created neighbor device: $neighborName"
+                        }
+
+                        if (-not $neighborDeviceId) {
+                            Write-Warning "Could not get NetBox ID for neighbor device $neighborName. Skipping its interfaces and IPs."
+                            continue
+                        }
+
+                        # Ensure neighbor interface exists in NetBox interfaces
+                        $neighborInterfaceName = $neighbor.remote_port
+                        $neighborInterfaceCheck = (Invoke-WebRequest -Uri "$netboxbaseurl/dcim/interfaces/?device_id=$neighborDeviceId&name=$neighborInterfaceName" -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json
+                        $neighborInterfaceId = $null
+                        if ($neighborInterfaceCheck.count -gt 0) {
+                            $neighborInterfaceId = $neighborInterfaceCheck.results[0].id
+                        }
+                        else {
+                            $neighborInterfacePayload = @{
+                                name        = $neighborInterfaceName
+                                device      = $neighborDeviceId
+                                type        = "other" # Assuming other type, adjust as needed
+                                mac_address = $neighbor.remote_mac_address
+                                description = "CDP neighbor interface"
+                            }
+                            $createIntfResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/interfaces/" -Headers $headers -Body ($neighborInterfacePayload | ConvertTo-Json) -SkipCertificateCheck
+                            $neighborInterfaceId = ($createIntfResp.Content | ConvertFrom-Json).id
+                            Write-Host "Created CDP neighbor interface: $neighborInterfaceName"
+                        }
+
+                        # Ensure neighbor IP exists in NetBox ip-addresses and assign to interface
+                        $neighborIp = $neighbor.remote_ip_address
+                        if (![string]::IsNullOrWhiteSpace($neighborIp)) {
+                            $neighborIpCheck = (Invoke-WebRequest -Uri "$netboxbaseurl/ipam/ip-addresses/?address=$neighborIp" -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json
+                            $ipPayload = @{
+                                address              = $neighborIp
+                                status               = "active"
+                                description          = "Discovered as LLDP neighbor of $hostname"
+                                assigned_object_type = "dcim.interface"
+                                assigned_object_id   = $neighborInterfaceId
+                            }
+                            $netboxNeighborIpId = $null
+                            if ($neighborIpCheck.count -eq 0) {
+                                $createIpResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/ipam/ip-addresses/" -Headers $headers -Body ($ipPayload | ConvertTo-Json) -SkipCertificateCheck
+                                $netboxNeighborIpId = ($createIpResp.Content | ConvertFrom-Json).id
+                                Write-Host "Created and assigned neighbor IP: $neighborIp"
+                            } else {
+                                $netboxNeighborIpId = $neighborIpCheck.results[0].id
+                                # Patch if not assigned to this interface
+                                if ($neighborIpCheck.results[0].assigned_object.id -ne $neighborInterfaceId) {
+                                    $patchPayload = @{
+                                        assigned_object_type = "dcim.interface"
+                                        assigned_object_id   = $neighborInterfaceId
+                                    } | ConvertTo-Json
+                                    Invoke-WebRequest -Method Patch -Uri "$netboxbaseurl/ipam/ip-addresses/$netboxNeighborIpId/" -Headers $headers -Body $patchPayload -SkipCertificateCheck
+                                    Write-Host "Updated neighbor IP assignment for $neighborIp"
+                                }
+                            }
+                            # Set as primary IPv4 for the neighbor device if not already set
+                            if ($netboxNeighborIpId) {
+                                $neighborDeviceCheck = (Invoke-WebRequest -Uri "$netboxbaseurl/dcim/devices/$neighborDeviceId/" -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json
+                                if (-not $neighborDeviceCheck.primary_ip4 -or $neighborDeviceCheck.primary_ip4.id -ne $netboxNeighborIpId) {
+                                    $primaryPayload = @{
+                                        primary_ip4 = $netboxNeighborIpId
+                                    } | ConvertTo-Json
+                                    Invoke-WebRequest -Method Patch -Uri "$netboxbaseurl/dcim/devices/$neighborDeviceId/" -Headers $headers -Body $primaryPayload -SkipCertificateCheck
+                                    Write-Host "Set $neighborIp as primary IPv4 for neighbor device $neighborName"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            Write-Host "No LLDP neighbors found for $hostname."
+        }
+    }
+    catch {
+        Write-Warning "Failed to fetch LLDP neighbors for $hostname $_"
     }
 
     # 5.4 Fetch and Sync ARP entries for the current device
@@ -171,8 +379,8 @@ foreach ($device in $deviceList) {
                 else {
                     # ARP IP does not exist, create it without an interface assignment
                     $arpPayload = @{
-                        address = $arpIp
-                        status = "active"
+                        address     = $arpIp
+                        status      = "active"
                         description = $arpDescription
                     } | ConvertTo-Json
                     Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/ipam/ip-addresses/" -Headers $headers -Body $arpPayload -SkipCertificateCheck
