@@ -73,7 +73,11 @@ foreach ($device in $deviceList) {
     $hostname = $device.'host-name'
     $systemIp = $device.'system-ip'
     Write-Host "`n--- Processing Device: $hostname ($systemIp) ---"
-
+ # Skip controllers, as they don't have CDP neighbors to check
+    if ($hostname -like "vmanage*" -or $hostname -like "vsmart*") {
+        Write-Host "Skipping CDP check for controller: $hostname"
+        continue # Moves to the next device in the loop
+    }
     # 5.1: Sync Device Object
     $deviceCheck = (Invoke-WebRequest -Uri "$netboxbaseurl/dcim/devices/?name=$hostname" -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json
     $netboxDeviceId = $null
