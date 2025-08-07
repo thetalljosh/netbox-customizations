@@ -73,8 +73,8 @@ foreach ($device in $deviceList) {
     $hostname = $device.'host-name'
     $systemIp = $device.'system-ip'
     Write-Host "`n--- Processing Device: $hostname ($systemIp) ---"
- # Skip controllers, as they don't have CDP neighbors to check
-    if ($hostname -like "vmanage*" -or $hostname -like "vsmart*" -or $hostname -like "vbond*") {
+    # Skip controllers, as they don't have CDP neighbors to check
+    if ($hostname -like "vmanage*" -or $hostname -like "vsmart*" -or $hostname -like "vBond*") {
         Write-Host "Skipping CDP check for controller: $hostname"
         continue # Moves to the next device in the loop
     }
@@ -205,14 +205,28 @@ foreach ($device in $deviceList) {
                     }
                     # Ensure neighbor model exists in NetBox device-types
                     $neighborModel = $neighbor.remote_system.platform
-                    if (![string]::IsNullOrWhiteSpace($neighborModel) -and -not $deviceTypeIdMap.ContainsKey($neighborModel)) {
-                        $modelPayload = @{
-                            model        = $neighborModel
-                            manufacturer = 1 # Cisco
-                            slug         = $neighborModel.ToLower() -replace '[^a-z0-9]+', '-'
-                        } | ConvertTo-Json
-                        $modelResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/device-types/" -Headers $headers -Body $modelPayload -SkipCertificateCheck
-                        $deviceTypeIdMap[$neighborModel] = ($modelResp.Content | ConvertFrom-Json).id
+                    if (-not [string]::IsNullOrWhiteSpace($neighborModel)) {
+                        # First, check our local lookup table for this run
+                        if (-not $deviceTypeIdMap.ContainsKey($neighborModel)) {
+                            # If not in the local table, check the NetBox API to see if it already exists
+                            $modelCheck = (Invoke-WebRequest -Uri "$netboxbaseurl/dcim/device-types/?model=$neighborModel" -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json
+                        
+                            if ($modelCheck.count -gt 0) {
+                                # It already exists in NetBox, so just add its ID to our local table for this run
+                                $deviceTypeIdMap[$neighborModel] = $modelCheck.results[0].id
+                            }
+                            else {
+                                # It doesn't exist in NetBox either, NOW we can safely create it
+                                Write-Host "Device Type '$neighborModel' not found, creating it..."
+                                $modelPayload = @{
+                                    model        = $neighborModel
+                                    manufacturer = 1 # Cisco
+                                    slug         = $neighborModel.ToLower() -replace '[^a-z0-9]+', '-'
+                                } | ConvertTo-Json
+                                $modelResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/device-types/" -Headers $headers -Body $modelPayload -SkipCertificateCheck
+                                $deviceTypeIdMap[$neighborModel] = ($modelResp.Content | ConvertFrom-Json).id
+                            }
+                        }
                     }
                   
                     
@@ -223,8 +237,8 @@ foreach ($device in $deviceList) {
                         $neighborDeviceId = $null
 
                         $neighborPayload = @{
-                            serial      = ""
-                            status      = "active"
+                            serial = ""
+                            status = "active"
                         }
 
                         if ($neighborCheck.count -gt 0) {
@@ -306,7 +320,8 @@ foreach ($device in $deviceList) {
                                 $createIpResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/ipam/ip-addresses/" -Headers $headers -Body ($ipPayload | ConvertTo-Json) -SkipCertificateCheck
                                 $netboxNeighborIpId = ($createIpResp.Content | ConvertFrom-Json).id
                                 Write-Host "Created and assigned neighbor IP: $neighborIp"
-                            } else {
+                            }
+                            else {
                                 $netboxNeighborIpId = $neighborIpCheck.results[0].id
                                 # Patch if not assigned to this interface
                                 if ($neighborIpCheck.results[0].assigned_object.id -ne $neighborInterfaceId) {
