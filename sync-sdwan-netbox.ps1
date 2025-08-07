@@ -3,23 +3,14 @@ param(
 )
 
 # --- Step 1: Authenticate to SD-WAN and get JSESSIONID ---
-$baseURI = "https://VMANAGEINSTANCEID.sdwan.cisco.com/dataservice"
+$baseURI = "https://vmanage-FAKE.sdwan.cisco.com/dataservice"
 $response = Invoke-WebRequest -Method Post `
-    -Uri "https://VMANAGEINSTANCEID.sdwan.cisco.com/j_security_check" `
+    -Uri "https://vmanage-FAKE.sdwan.cisco.com/j_security_check" `
     -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
-    -Body "j_username=FAKEUSER&j_password=FAKEPASSWORD" `
+    -Body "j_username=FAKE&j_password=FAKE" `
     -SkipCertificateCheck
 
 $jsessionid = if ($response.RawContent -match "JSESSIONID=([^;]+)") { $matches[1] } else { throw "Failed to get JSESSIONID." }
-
-# --- Step 2: Configure NetBox API Access ---
-$netboxbaseurl = "https://NETBOXURI/api"
-$netboxtoken = "NETBOXAPITOKEN"
-$headers = @{
-    "accept"        = "application/json"
-    "Authorization" = "Token $netboxtoken"
-    "Content-Type"  = "application/json"
-}
 # Get the CSRF token from the vManage server
 $tokenResponse = Invoke-WebRequest -Method Get `
     -Uri "$baseuri/client/token" `
@@ -34,8 +25,8 @@ $vManageHeaders = @{
     "X-XSRF-TOKEN" = $token
 }
 # --- Step 2: Configure NetBox API Access ---
-$netboxbaseurl = "https://NETBOXADDRESS/api"
-$netboxtoken = "NETBOXTOKEN"
+$netboxbaseurl = "https://FAKE.net/api"
+$netboxtoken = "FAKE"
 $headers = @{
     "accept"        = "application/json"
     "Authorization" = "Token $netboxtoken"
@@ -63,6 +54,17 @@ $siteIdMap = @{}
 ($deviceList | ForEach-Object { $_.'host-name'.Split("-")[0] } | Select-Object -Unique) | ForEach-Object {
     $result = (Invoke-WebRequest -Uri "$netboxbaseurl/dcim/sites/?name=$_" -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json
     if ($result.count -gt 0) { $siteIdMap[$_] = $result.results[0].id }
+}
+
+if (-not $roleIdMap.ContainsKey("Switch")) {
+    Write-Host "Device role 'Switch' not found, creating it..."
+    $rolePayload = @{
+        name  = "Switch"
+        slug  = "switch"
+        color = "3498db" # A nicer blue than bright green
+    } | ConvertTo-Json
+    $roleResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/device-roles/" -Headers $headers -Body $rolePayload -SkipCertificateCheck
+    $roleIdMap["Switch"] = ($roleResp.Content | ConvertFrom-Json).id
 }
 Write-Host "Lookup tables built."
 
@@ -180,17 +182,17 @@ foreach ($device in $deviceList) {
         }
     }
 
-    # Hit the netbox API and get lldp neighbors with the napalm plugin and deviceid
-    # Fetch LLDP neighbors using the NetBox napalm plugin for this device
-    # http://netbox/api/dcim/devices/64/napalm/?method=get_lldp_neighbors
-    # plugins/netbox_napalm_plugin/napalmplatformconfig/55/napalm/?method=get_lldp_neighbors
+    # Hit the netbox API and get CDP neighbors with the napalm plugin and deviceid
+    # Fetch CDP neighbors using the NetBox napalm plugin for this device
+    # http://netbox/api/dcim/devices/64/napalm/?method=get_CDP_neighbors
+    # plugins/netbox_napalm_plugin/napalmplatformconfig/55/napalm/?method=get_CDP_neighbors
     $napalmUri = "$netboxbaseurl/plugins/netbox_napalm_plugin/napalmplatformconfig/$netboxDeviceId/napalm/?method=get_cdp_neighbors_detail"
     try {
-        $lldpResponse = Invoke-WebRequest -Method Get -Uri $napalmUri -Headers $headers -SkipCertificateCheck
-        $lldpNeighbors = ($lldpResponse.Content | ConvertFrom-Json).get_cdp_neighbors_detail
-        if ($lldpNeighbors) {
-            Write-Host "LLDP neighbors for $hostname"
-            $lldpNeighbors.PSObject.Properties | ForEach-Object {
+        $CDPResponse = Invoke-WebRequest -Method Get -Uri $napalmUri -Headers $headers -SkipCertificateCheck
+        $CDPNeighbors = ($CDPResponse.Content | ConvertFrom-Json).get_cdp_neighbors_detail
+        if ($CDPNeighbors) {
+            Write-Host "CDP neighbors for $hostname"
+            $CDPNeighbors.PSObject.Properties | ForEach-Object {
                 $localInt = $_.Name
                 foreach ($neighbor in $_.Value) {
                     Write-Host "  Local Interface: $localInt"
@@ -209,28 +211,7 @@ foreach ($device in $deviceList) {
                         $deviceTypeIdMap[$neighborModel] = ($modelResp.Content | ConvertFrom-Json).id
                     }
                   
-                    # Ensure device role "Switch" exists
-                    if (-not $roleIdMap.ContainsKey("Switch")) {
-                        $rolePayload = @{
-                            name  = "Switch"
-                            slug  = "switch"
-                            color = "00ff00"
-                        } | ConvertTo-Json
-                        $roleResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/device-roles/" -Headers $headers -Body $rolePayload -SkipCertificateCheck
-                        $roleIdMap["Switch"] = ($roleResp.Content | ConvertFrom-Json).id
-                    }
-
-                    # Ensure site exists (use the same as the current device)
-                    $neighborSite = $hostname.Split("-")[0]
-                    if (-not $siteIdMap.ContainsKey($neighborSite)) {
-                        $sitePayload = @{
-                            name = $neighborSite
-                            slug = $neighborSite.ToLower()
-                        } | ConvertTo-Json
-                        $siteResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/sites/" -Headers $headers -Body $sitePayload -SkipCertificateCheck
-                        $siteIdMap[$neighborSite] = ($siteResp.Content | ConvertFrom-Json).id
-                    }
-
+                    
                     # Check if the neighbor device already exists
                     $neighborName = $neighbor.remote_system_name
                     if (![string]::IsNullOrWhiteSpace($neighborName)) {
@@ -249,7 +230,7 @@ foreach ($device in $deviceList) {
                             if ($roleIdMap.ContainsKey("Switch")) { $neighborPayload.role = $roleIdMap["Switch"] }
                             if ($siteIdMap.ContainsKey($neighborSite)) { $neighborPayload.site = $siteIdMap[$neighborSite] }
                             $neighborPayload.platform = 1 # Assuming Cisco platform
-                            $neighborPayload.description = "Discovered as LLDP neighbor of $hostname"
+                            $neighborPayload.description = "Discovered as CDP neighbor of $hostname"
                             if ($neighbor.remote_mac_address) { $neighborPayload.mac_address = $neighbor.remote_mac_address }
                             # Remove null or empty properties
                             $neighborPayload = $neighborPayload.GetEnumerator() | Where-Object { $_.Value -ne $null -and $_.Value -ne "" } | ForEach-Object { @{ ($_.Key) = $_.Value } }
@@ -267,7 +248,7 @@ foreach ($device in $deviceList) {
                             $neighborPayload.role = $roleIdMap["Switch"]
                             $neighborPayload.site = $siteIdMap[$neighborSite]
                             $neighborPayload.platform = 1 # Assuming Cisco platform
-                            $neighborPayload.description = "Discovered as LLDP neighbor of $hostname"
+                            $neighborPayload.description = "Discovered as CDP neighbor of $hostname"
                             if ($neighbor.remote_mac_address) { $neighborPayload.mac_address = $neighbor.remote_mac_address }
                             # Remove null or empty properties
                             $neighborPayload = $neighborPayload.GetEnumerator() | Where-Object { $_.Value -ne $null -and $_.Value -ne "" } | ForEach-Object { @{ ($_.Key) = $_.Value } }
@@ -312,7 +293,7 @@ foreach ($device in $deviceList) {
                             $ipPayload = @{
                                 address              = $neighborIp
                                 status               = "active"
-                                description          = "Discovered as LLDP neighbor of $hostname"
+                                description          = "Discovered as CDP neighbor of $hostname"
                                 assigned_object_type = "dcim.interface"
                                 assigned_object_id   = $neighborInterfaceId
                             }
@@ -350,11 +331,11 @@ foreach ($device in $deviceList) {
             }
         }
         else {
-            Write-Host "No LLDP neighbors found for $hostname."
+            Write-Host "No CDP neighbors found for $hostname."
         }
     }
     catch {
-        Write-Warning "Failed to fetch LLDP neighbors for $hostname $_"
+        Write-Warning "Failed to fetch CDP neighbors for $hostname $_"
     }
 
     # 5.4 Fetch and Sync ARP entries for the current device
