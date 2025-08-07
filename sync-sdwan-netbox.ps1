@@ -74,7 +74,7 @@ foreach ($device in $deviceList) {
     $systemIp = $device.'system-ip'
     Write-Host "`n--- Processing Device: $hostname ($systemIp) ---"
  # Skip controllers, as they don't have CDP neighbors to check
-    if ($hostname -like "vmanage*" -or $hostname -like "vsmart*") {
+    if ($hostname -like "vmanage*" -or $hostname -like "vsmart*" -or $hostname -like "vbond*") {
         Write-Host "Skipping CDP check for controller: $hostname"
         continue # Moves to the next device in the loop
     }
