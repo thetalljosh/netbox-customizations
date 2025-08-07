@@ -3,11 +3,11 @@ param(
 )
 
 # --- Step 1: Authenticate to SD-WAN and get JSESSIONID ---
-$baseURI = "https://vmanage-2025324.sdwan.cisco.com/dataservice"
+$baseURI = "https://CONTOSO.sdwan.cisco.com/dataservice"
 $response = Invoke-WebRequest -Method Post `
-    -Uri "https://vmanage-2025324.sdwan.cisco.com/j_security_check" `
+    -Uri "https://CONTOSO.sdwan.cisco.com/j_security_check" `
     -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
-    -Body "j_username=lucklv15&j_password=Get0ffmyl@wn" `
+    -Body "j_username=CONTOSO&j_password=CONTOSO" `
     -SkipCertificateCheck
 
 $jsessionid = if ($response.RawContent -match "JSESSIONID=([^;]+)") { $matches[1] } else { throw "Failed to get JSESSIONID." }
@@ -25,8 +25,8 @@ $vManageHeaders = @{
     "X-XSRF-TOKEN" = $token
 }
 # --- Step 2: Configure NetBox API Access ---
-$netboxbaseurl = "https://ipam.luck.net/api"
-$netboxtoken = "98408a53f0e02608dbfd9a0fb079bc760746e6b7"
+$netboxbaseurl = "https://ipam.CONTOSO.net/api"
+$netboxtoken = "CONTOSO"
 $headers = @{
     "accept"        = "application/json"
     "Authorization" = "Token $netboxtoken"
