@@ -3,11 +3,11 @@ param(
 )
 
 # --- Step 1: Authenticate to SD-WAN and get JSESSIONID ---
-$baseURI = "https://vmanage-FAKE.sdwan.cisco.com/dataservice"
+$baseURI = "https://vmanage-2025324.sdwan.cisco.com/dataservice"
 $response = Invoke-WebRequest -Method Post `
-    -Uri "https://vmanage-FAKE.sdwan.cisco.com/j_security_check" `
+    -Uri "https://vmanage-2025324.sdwan.cisco.com/j_security_check" `
     -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
-    -Body "j_username=FAKE&j_password=FAKE" `
+    -Body "j_username=lucklv15&j_password=Get0ffmyl@wn" `
     -SkipCertificateCheck
 
 $jsessionid = if ($response.RawContent -match "JSESSIONID=([^;]+)") { $matches[1] } else { throw "Failed to get JSESSIONID." }
@@ -25,8 +25,8 @@ $vManageHeaders = @{
     "X-XSRF-TOKEN" = $token
 }
 # --- Step 2: Configure NetBox API Access ---
-$netboxbaseurl = "https://FAKE.net/api"
-$netboxtoken = "FAKE"
+$netboxbaseurl = "https://ipam.luck.net/api"
+$netboxtoken = "98408a53f0e02608dbfd9a0fb079bc760746e6b7"
 $headers = @{
     "accept"        = "application/json"
     "Authorization" = "Token $netboxtoken"
@@ -190,6 +190,7 @@ foreach ($device in $deviceList) {
     # Fetch CDP neighbors using the NetBox napalm plugin for this device
     # http://netbox/api/dcim/devices/64/napalm/?method=get_CDP_neighbors
     # plugins/netbox_napalm_plugin/napalmplatformconfig/55/napalm/?method=get_CDP_neighbors
+
     $napalmUri = "$netboxbaseurl/plugins/netbox_napalm_plugin/napalmplatformconfig/$netboxDeviceId/napalm/?method=get_cdp_neighbors_detail"
     try {
         $CDPResponse = Invoke-WebRequest -Method Get -Uri $napalmUri -Headers $headers -SkipCertificateCheck
@@ -199,6 +200,10 @@ foreach ($device in $deviceList) {
             $CDPNeighbors.PSObject.Properties | ForEach-Object {
                 $localInt = $_.Name
                 foreach ($neighbor in $_.Value) {
+                    $neighborPayload = @{
+                        serial = ""
+                        status = "active"
+                    }
                     Write-Host "  Local Interface: $localInt"
                     foreach ($key in $neighbor.PSObject.Properties.Name) {
                         Write-Host "    $key : $($neighbor.$key)"
@@ -236,9 +241,16 @@ foreach ($device in $deviceList) {
                         $neighborCheck = (Invoke-WebRequest -Uri "$netboxbaseurl/dcim/devices/?name=$neighborName" -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json
                         $neighborDeviceId = $null
 
-                        $neighborPayload = @{
-                            serial = ""
-                            status = "active"
+                        $neighborSite = $hostname.Split("-")[0]
+
+                        # Ensure site exists (use the same as the current device)
+                        if (-not $siteIdMap.ContainsKey($neighborSite)) {
+                            $sitePayload = @{
+                                name = $neighborSite
+                                slug = $neighborSite.ToLower()
+                            } | ConvertTo-Json
+                            $siteResp = Invoke-WebRequest -Method Post -Uri "$netboxbaseurl/dcim/sites/" -Headers $headers -Body $sitePayload -SkipCertificateCheck
+                            $siteIdMap[$neighborSite] = ($siteResp.Content | ConvertFrom-Json).id
                         }
 
                         if ($neighborCheck.count -gt 0) {
