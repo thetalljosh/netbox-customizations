@@ -1,8 +1,4 @@
-Of course. Based on the powerful and well-structured script you've finalized, here is a comprehensive `README.md` file suitable for a GitHub repository.
-
------
-
-# NetBox SD-WAN and CDP Discovery Script
+# NetBox SD-WAN and CDP Discovery Script: sync-sdwan-netbox-v2.ps1
 
 This PowerShell script provides a robust, multi-layered approach to populating a NetBox instance. It begins by ingesting all edge devices from a Cisco SD-WAN (vManage) environment and then recursively discovers and maps their connected neighbors via CDP.
 
