@@ -185,11 +185,62 @@ function Sync-DeviceToNetBox {
     return $netboxDeviceId
 }
 
+function Connect-NetBoxInterfaces {
+    param(
+        [Parameter(Mandatory = $true)] $InterfaceA_ID,
+        [Parameter(Mandatory = $true)] $InterfaceB_ID,
+        [Parameter(Mandatory = $true)] $Headers,
+        [Parameter(Mandatory = $true)] $NetboxBaseUrl
+    )
+
+    # Check if interface A is already connected to prevent errors
+    $checkA = (Invoke-WebRequest -Uri "$NetboxBaseUrl/dcim/interfaces/$InterfaceA_ID/" -Headers $Headers -SkipCertificateCheck).Content | ConvertFrom-Json
+    if ($checkA.cable) {
+        Write-Host "--> Interface ID $InterfaceA_ID is already connected. Skipping cable creation."
+        return
+    }
+
+    # Check if interface B is already connected
+    $checkB = (Invoke-WebRequest -Uri "$NetboxBaseUrl/dcim/interfaces/$InterfaceB_ID/" -Headers $Headers -SkipCertificateCheck).Content | ConvertFrom-Json
+    if ($checkB.cable) {
+        Write-Host "--> Interface ID $InterfaceB_ID is already connected. Skipping cable creation."
+        return
+    }
+
+    # Construct the payload according to the required nested schema.
+    $cablePayload = @{
+        type = "cat6"
+        a_terminations = @(
+            @{
+                object_type = "dcim.interface"
+                object_id   = $InterfaceA_ID
+            }
+        )
+        b_terminations = @(
+            @{
+                object_type = "dcim.interface"
+                object_id   = $InterfaceB_ID
+            }
+        )
+        status = "connected"
+    }
+
+$cablePayload = $cablePayload | ConvertTo-Json -Depth 5
+
+    try {
+        Invoke-WebRequest -Method Post -Uri "$NetboxBaseUrl/dcim/cables/" -Headers $Headers -Body $cablePayload -SkipCertificateCheck -ErrorAction Stop
+        Write-Host "--> Successfully created cable between interface $InterfaceA_ID and $InterfaceB_ID."
+    }
+    catch {
+        Write-Warning "--> Failed to create cable between interface $InterfaceA_ID and $InterfaceB_ID : $_"
+    }
+}
+
 
 # --- Step 1: Authenticate to SD-WAN and get JSESSIONID ---
-$baseURI = "https://CONTOSO.sdwan.cisco.com/dataservice"
+$baseURI = "https://vmanage-CONTOSO.sdwan.cisco.com/dataservice"
 $response = Invoke-WebRequest -Method Post `
-    -Uri "https://CONTOSO.sdwan.cisco.com/j_security_check" `
+    -Uri "https://vmanage-CONTOSO.sdwan.cisco.com/j_security_check" `
     -Headers @{ "Content-Type" = "application/x-www-form-urlencoded" } `
     -Body "j_username=CONTOSO&j_password=CONTOSO" `
     -SkipCertificateCheck
@@ -205,8 +256,8 @@ $vManageHeaders = @{
 }
 
 # --- Step 2: Configure NetBox API Access ---
-$netboxbaseurl = "https://ipam.CONTOSO.net/api"
-$netboxtoken = "CONTOSOTOKEN"
+$netboxbaseurl = "https://CONTOSO.net/api"
+$netboxtoken = "CONTOSO"
 $headers = @{
     "accept"        = "application/json"
     "Authorization" = "Token $netboxtoken"
@@ -308,43 +359,67 @@ foreach ($device in $deviceList) {
                         RoleName               = $neighborRole
                         DeviceModel            = $Neighbor.remote_system.platform
                         Status                 = "active"
-                        Description            = "Discovered as CDP neighbor of $hostname"
+                        Description            = $neighbor.remote_system.neighbor_description
                         Interfaces             = @(
                             @{
-                                Name      = $neighbor.remote_port
+                                Name      = $neighbor.remote_interface
                                 IPAddress = $neighbor.remote_ip_address # May need prefix
                                 Type      = "other"
                             }
                         )
-                        PrimaryIPInterfaceName = $neighbor.remote_port # Set its management IP as primary
+                        PrimaryIPInterfaceName = $neighbor.remote_interface # Set its management IP as primary
                     }
 
                     # Call the same function to sync the neighbor!
                     $neighborDevice = (Sync-DeviceToNetBox -DeviceInfo $neighborInfo -Headers $headers -NetboxBaseUrl $netboxbaseurl -SiteIdMap $siteIdMap -RoleIdMap $roleIdMap -DeviceTypeIdMap $deviceTypeIdMap -discoveredByCDP $true) | ConvertFrom-Json
                     $neighborDeviceId = $neighborDevice[0].id
                     if ($neighborDeviceId) {
+                        # --- CREATE CABLE CONNECTION (LEVEL 1) ---
+                        # Get the local interface ID
+                        $localInterfaceUri = "$netboxbaseurl/dcim/interfaces/?device_id=$netboxDeviceId&name=$localInterfaceName"
+                        $localInterfaceId = ((Invoke-WebRequest -Uri $localInterfaceUri -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json).results[0].id
+
+                        # Get the remote interface ID
+                        $remoteInterfaceUri = "$netboxbaseurl/dcim/interfaces/?device_id=$neighborDeviceId&name=$remoteInterfaceName"
+                        $remoteInterfaceId = ((Invoke-WebRequest -Uri $remoteInterfaceUri -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json).results[0].id
+
+                        if ($localInterfaceId -and $remoteInterfaceId) {
+                            Connect-NetBoxInterfaces -InterfaceA_ID $localInterfaceId -InterfaceB_ID $remoteInterfaceId -Headers $headers -NetboxBaseUrl $netboxbaseurl
+                        }
+                        # --- END CABLE LOGIC ---
+
                         # RECURSIVE STEP: Discover neighbors of the neighbor
                         # You can add a depth counter here to prevent infinite loops
                         Write-Host "--> Discovering neighbors of neighbor '$($neighbor.remote_system_name)'"
                         
-                        # **Create a new headers object with specific NAPALM credentials**
-                        $napalmHeaders = $headers.Clone()
-                        $napalmHeaders.Add("X-NAPALM-Username", "CONTOSO")
-                        $napalmHeaders.Add("X-NAPALM-Password", "CONTOSO!")
-
+                        # Array of possible NAPALM passwords to try
+                        $napalmPasswords = @( "2Twoleftfeetright", "d0ntgethacked!", "Get0ffmyl@wn") # Add more as needed
+                        $napalmUsernames = @("lucksw", "lucklv15") # Add more as needed
                         $neighborNapalmUri = "$netboxbaseurl/plugins/netbox_napalm_plugin/napalmplatformconfig/$neighborDeviceId/napalm/?method=get_cdp_neighbors_detail"
-                        try {
-                            # **Use the new $napalmHeaders for this request**
-                            $nCdpResponse = Invoke-WebRequest -Method Get -Uri $neighborNapalmUri -Headers $napalmHeaders -SkipCertificateCheck 
+
+                        $nCdpResponse = $null
+                        foreach ($napalmUsername in $napalmUsernames) {
+                            # Try each password for the current username
+                            foreach ($napalmPassword in $napalmPasswords) {
+                                $napalmHeaders = $headers.Clone()
+                                $napalmHeaders["X-NAPALM-Username"] = $napalmUsername
+                                $napalmHeaders["X-NAPALM-Password"] = $napalmPassword
+                                try {
+                                    $nCdpResponse = Invoke-WebRequest -Method Get -Uri $neighborNapalmUri -Headers $napalmHeaders -SkipCertificateCheck -ErrorAction Stop
+                                    break # Success, exit loop
+                                }
+                                catch {
+                                    Write-Warning "NAPALM authentication failed for Username '$napalmUsername' on neighbor '$($neighbor.remote_system_name)'."
+                                    $nCdpResponse = $null
+                                }
+                            }
+                        }
+
+                        if ($nCdpResponse) {
                             $nCdpNeighbors = ($nCdpResponse.Content | ConvertFrom-Json).get_cdp_neighbors_detail
                             if ($nCdpNeighbors) {
                                 $nCdpNeighbors.PSObject.Properties | ForEach-Object {
                                     foreach ($nNeighbor in $_.Value) {
-                                        # $nNeighborCapabilities = $nNeighbor.remote_system.capabilities
-                                        # if ($nNeighborCapabilities -eq "R") {
-                                        #     Write-Host "Skipping neighbor '$($nNeighbor.remote_system_name)' because it is a router."
-                                        #     continue
-                                        # }
                                         if ($nNeighbor.remote_system.platform -like "*-AP*") { $nNeighborRole = "Access Point" }
                                         else { $nNeighborRole = "Switch" }
                                         $nNeighborInfo = @{
@@ -353,18 +428,34 @@ foreach ($device in $deviceList) {
                                             RoleName               = $nNeighborRole
                                             DeviceModel            = $nNeighbor.remote_system.platform
                                             Status                 = "active"
-                                            Description            = "Discovered as CDP neighbor of $($neighbor.remote_system_name)"
-                                            Interfaces             = @( @{ Name = $nNeighbor.remote_port; IPAddress = $nNeighbor.remote_ip_address; Type = "other" } )
-                                            PrimaryIPInterfaceName = $nNeighbor.remote_port
+                                            Description            = "Discovered as CDP neighbor of $($neighbor.remote_system_name): $($nNeighbor.remote_system.neighbor_description)"
+                                            Interfaces             = @( @{ Name = $nNeighbor.remote_interface; IPAddress = $nNeighbor.remote_ip_address; Type = "other" } )
+                                            PrimaryIPInterfaceName = $nNeighbor.remote_interface
                                         }
-                                        # And again, we call the same function...
-                                        Sync-DeviceToNetBox -DeviceInfo $nNeighborInfo -Headers $headers -NetboxBaseUrl $netboxbaseurl -SiteIdMap $siteIdMap -RoleIdMap $roleIdMap -DeviceTypeIdMap $deviceTypeIdMap -discoveredByCDP $true
+                                        $nNeighborDeviceResult = Sync-DeviceToNetBox -DeviceInfo $nNeighborInfo -Headers $headers -NetboxBaseUrl $netboxbaseurl -SiteIdMap $siteIdMap -RoleIdMap $roleIdMap -DeviceTypeIdMap $deviceTypeIdMap -discoveredByCDP $true
+                                        $nNeighborDeviceId = ($nNeighborDeviceResult | ConvertFrom-Json)[0].id
+
+                                        if ($nNeighborDeviceId) {
+                                            # --- CREATE CABLE CONNECTION (LEVEL 2) ---
+                                            $nLocalInterfaceName = $_.Name # This is the interface on the first neighbor
+                                            $nRemoteInterfaceName = $nNeighbor.remote_port # This is the interface on the second neighbor
+
+                                            # Get the local interface ID (on the first neighbor device)
+                                            $nLocalInterfaceUri = "$netboxbaseurl/dcim/interfaces/?device_id=$neighborDeviceId&name=$nLocalInterfaceName"
+                                            $nLocalInterfaceId = ((Invoke-WebRequest -Uri $nLocalInterfaceUri -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json).results[0].id
+
+                                            # Get the remote interface ID (on the second neighbor device)
+                                            $nRemoteInterfaceUri = "$netboxbaseurl/dcim/interfaces/?device_id=$nNeighborDeviceId&name=$nRemoteInterfaceName"
+                                            $nRemoteInterfaceId = ((Invoke-WebRequest -Uri $nRemoteInterfaceUri -Headers $headers -SkipCertificateCheck).Content | ConvertFrom-Json).results[0].id
+
+                                            if ($nLocalInterfaceId -and $nRemoteInterfaceId) {
+                                                Connect-NetBoxInterfaces -InterfaceA_ID $nLocalInterfaceId -InterfaceB_ID $nRemoteInterfaceId -Headers $headers -NetboxBaseUrl $netboxbaseurl
+                                            }
+                                            # --- END CABLE LOGIC ---
+                                        }
                                     }
                                 }
                             }
-                        }
-                        catch {
-                            Write-Warning "Failed to fetch CDP for neighbor '$($neighbor.remote_system_name)': $_"
                         }
                     }
                 }
@@ -374,6 +465,9 @@ foreach ($device in $deviceList) {
     catch {
         Write-Warning "Failed to fetch CDP neighbors for $hostname : $_"
     }
+
+        
+                
 
     # 5.3 Fetch and Sync ARP entries (kept as is)
     $arpUri = "$baseuri/device/arp?deviceId=$systemIp"
